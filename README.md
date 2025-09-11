@@ -1,5 +1,7 @@
 # WP Notion Sync
 
+![WP Notion Sync](assets/wp%20notion%20sync.png)
+
 Sync content from Notion Database into WordPress posts.  
 - Supports blocks: headings, paragraphs, lists, quotes, code, todo, toggle, divider, image  
 - Images are sideloaded into Media Library  

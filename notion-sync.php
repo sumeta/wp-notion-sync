@@ -2,37 +2,106 @@
 /**
  * Plugin Name: Notion Sync
 * Description: Sync Notion Database → WordPress (Free). Supports blocks: heading_1/2/3, paragraph, bulleted_list_item, numbered_list_item, quote, code, to_do, toggle, divider, image. Images are stored in Media Library and content updates automatically.
- * Version:     0.1.0
+ * Version:     0.2.0
  * Author:      Sumeta.P
  */
 
 // ====== CONFIG ======
-const NOTION_API_TOKEN    = 'secret_xxx_put_yours_here';
-const NOTION_DATABASE_ID  = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; // 32-character ID from the URL
+const NOTION_API_TOKEN    = '';
+const NOTION_DATABASE_ID  = ''; // 32-character ID from the URL
 const NOTION_API_BASE     = 'https://api.notion.com/v1';
 const NOTION_API_VERSION  = '2022-06-28';
 
 // Property names in the Notion Database
-const PROP_TITLE          = 'Name';          // type: title
-const PROP_STATUS         = 'Status';        // type: status (filter by Ready public)
-const STATUS_EQUALS       = 'Ready public';  // Only sync records with this value
+const PROP_TITLE          = '';          // type: title
+const PROP_STATUS         = '';        // type: status (filter by Ready public)
+const STATUS_EQUALS       = '';  // Only sync records with this value
+const STATUS_TO_CHANGE    = '';  // Set to this status after successful sync
+
+// Runtime configuration getters (UI options override defaults when constants are empty)
+function ns_get_option($suffix, $default = ''){
+    $name = 'notion_sync_' . $suffix;
+    $val = get_option($name, null);
+    if ($val === null || $val === '') return $default;
+    return is_string($val) ? trim($val) : $val;
+}
+function ns_api_token(){
+    if (defined('NOTION_API_TOKEN') && NOTION_API_TOKEN) return NOTION_API_TOKEN;
+    return ns_get_option('api_token', '');
+}
+function ns_database_id(){
+    if (defined('NOTION_DATABASE_ID') && NOTION_DATABASE_ID) return NOTION_DATABASE_ID;
+    return ns_get_option('database_id', '');
+}
+function ns_prop_title(){
+    if (defined('PROP_TITLE') && PROP_TITLE) return PROP_TITLE;
+    return ns_get_option('prop_title', 'Name');
+}
+function ns_prop_status(){
+    if (defined('PROP_STATUS') && PROP_STATUS) return PROP_STATUS;
+    return ns_get_option('prop_status', 'Status');
+}
+function ns_status_equals(){
+    if (defined('STATUS_EQUALS') && STATUS_EQUALS) return STATUS_EQUALS;
+    return ns_get_option('status_equals', 'Ready public');
+}
+function ns_status_to_change(){
+    if (defined('STATUS_TO_CHANGE') && STATUS_TO_CHANGE) return STATUS_TO_CHANGE;
+    return ns_get_option('status_to_change', 'แชร์บนเว็บ');
+}
+function ns_schedule_recurrence(){
+    $rec = ns_get_option('schedule', 'hourly');
+    $all = wp_get_schedules();
+    return isset($all[$rec]) ? $rec : 'hourly';
+}
 
 // WordPress target
 const TARGET_POST_TYPE    = 'post';
-const DEFAULT_POST_STATUS = 'draft';
+const DEFAULT_POST_STATUS = 'publish';
+
+// Selected post status (UI overrides default)
+function ns_post_status(){
+    $allowed = ['publish','draft','pending','private'];
+    $val = ns_get_option('post_status', DEFAULT_POST_STATUS);
+    $val = is_string($val) ? strtolower(trim($val)) : DEFAULT_POST_STATUS;
+    return in_array($val, $allowed, true) ? $val : DEFAULT_POST_STATUS;
+}
 
 // Debug toggle
 if (!defined('NOTION_SYNC_DEBUG')) define('NOTION_SYNC_DEBUG', true);
-function ns_log($x){ if (NOTION_SYNC_DEBUG) error_log('[NOTION-SYNC] '.(is_string($x)?$x:wp_json_encode($x))); }
+function ns_log($x){
+	if (!NOTION_SYNC_DEBUG) return;
+	$msg = '[NOTION-SYNC] '.(is_string($x)?$x:wp_json_encode($x));
+	// Always write to error log
+	error_log($msg);
+	// Also buffer in-memory for this request if enabled
+	global $notion_sync_request_logs;
+	if (is_array($notion_sync_request_logs)) { $notion_sync_request_logs[] = $msg; }
+}
 
 // ====== ACTIVATE / DEACTIVATE ======
 // - Set new cron named notion_sync_hourly
 // - Clear old cron from lean plugin (notion_lean_sync_hourly) if any
+// Custom additional schedules
+add_filter('cron_schedules', function($s){
+    if (!isset($s['every_5_minutes'])){
+        $s['every_5_minutes'] = ['interval'=>5*60, 'display'=>__('Every 5 Minutes')];
+    }
+    if (!isset($s['every_15_minutes'])){
+        $s['every_15_minutes'] = ['interval'=>15*60, 'display'=>__('Every 15 Minutes')];
+    }
+    if (!isset($s['every_30_minutes'])){
+        $s['every_30_minutes'] = ['interval'=>30*60, 'display'=>__('Every 30 Minutes')];
+    }
+    return $s;
+});
+
 register_activation_hook(__FILE__, function () {
     // kill old cron from "notion-lean-sync"
     wp_clear_scheduled_hook('notion_lean_sync_hourly');
+    $rec = ns_schedule_recurrence();
     if (!wp_next_scheduled('notion_sync_hourly')) {
-        wp_schedule_event(time()+60, 'hourly', 'notion_sync_hourly');
+        wp_schedule_event(time()+60, $rec, 'notion_sync_hourly');
     }
 });
 register_deactivation_hook(__FILE__, function () {
@@ -41,7 +110,7 @@ register_deactivation_hook(__FILE__, function () {
 
 add_action('notion_sync_hourly', function () { notion_sync_run(); });
 
-// ====== WP-CLI command (เหมือนเดิม) ======
+// ====== WP-CLI command ======
 if (defined('WP_CLI') && WP_CLI) {
     WP_CLI::add_command('notion sync', function($args, $assoc_args){
         notion_sync_run(true);
@@ -51,7 +120,7 @@ if (defined('WP_CLI') && WP_CLI) {
 
 // ====== MAIN SYNC ======
 function notion_sync_run($verbose=false){
-    $pages = notion_query_database_all(NOTION_DATABASE_ID);
+    $pages = notion_query_database_all(ns_database_id());
     if (!$pages) { ns_log('no pages'); return; }
 
     foreach ($pages as $page) {
@@ -59,11 +128,11 @@ function notion_sync_run($verbose=false){
         $props    = $page['properties'] ?? [];
         $editedAt = isset($page['last_edited_time']) ? strtotime($page['last_edited_time']) : time();
 
-        $title = notion_read_title($props[PROP_TITLE] ?? null);
+        $title = notion_read_title($props[ ns_prop_title() ] ?? null);
         if (!$title) { if($verbose) ns_log("skip $pageId (no title)"); continue; }
 
-        // Post status: If it passed the filter, it's Ready public → publish
-        $post_status = 'publish';
+        // Post status: from settings (fallback to default)
+        $post_status = ns_post_status();
 
         // Find existing post
         $existing = notion_find_post_by_page_id($pageId);
@@ -99,6 +168,9 @@ function notion_sync_run($verbose=false){
 
         update_post_meta($post_id, '_notion_last_edited', $editedAt);
         if($verbose) ns_log("synced $pageId -> post#$post_id");
+
+        // After successful sync, update Notion Status to configured value
+        notion_update_page_status($pageId, ns_status_to_change());
     }
 }
 
@@ -109,8 +181,8 @@ function notion_query_database_all($dbId){
     $payload = [
         'page_size' => 50,
         'filter' => [
-            'property' => PROP_STATUS,
-            'status'   => ['equals' => STATUS_EQUALS],
+            'property' => ns_prop_status(),
+            'status'   => ['equals' => ns_status_equals()],
         ],
     ];
 
@@ -263,7 +335,7 @@ function notion_request($path,$method='GET',$body=null){
     $args = [
         'method'=>$method,
         'headers'=>[
-            'Authorization'=>'Bearer '.NOTION_API_TOKEN,
+            'Authorization'=>'Bearer '.ns_api_token(),
             'Notion-Version'=>NOTION_API_VERSION,
             'Content-Type'=>'application/json',
         ],
@@ -315,6 +387,26 @@ function notion_rich_text_html($arr){
     return $h;
 }
 
+// Update a Notion page Status property to a specific status name
+function notion_update_page_status($pageId, $statusName){
+    $propName = ns_prop_status();
+    if (!$propName){ ns_log('skip status update: empty status property name'); return; }
+    if (!$statusName){ ns_log('skip status update: empty target status'); return; }
+
+    $payload = [
+        'properties' => [
+            $propName => [ 'status' => [ 'name' => $statusName ] ],
+        ],
+    ];
+
+    $res = notion_request('pages/'.$pageId, 'PATCH', $payload);
+    if (!$res){
+        ns_log('failed to update status for '.$pageId.' -> '.$statusName);
+    } else {
+        ns_log('updated status for '.$pageId.' -> '.$statusName);
+    }
+}
+
 // ====== WordPress helpers ======
 function notion_find_post_by_page_id($pageId){
     $q = new WP_Query([
@@ -357,3 +449,215 @@ function notion_media_sideload_by_url($url,$post_id=0,$desc=''){
     if ($desc) update_post_meta($id,'_wp_attachment_image_alt',sanitize_text_field($desc));
     return $id;
 }
+
+// ====== Admin Settings (UI) ======
+add_action('admin_menu', function(){
+    add_options_page(
+        'Notion Sync',
+        'Notion Sync',
+        'manage_options',
+        'notion-sync',
+        'notion_sync_render_settings_page'
+    );
+});
+
+add_action('admin_post_notion_sync_save', 'notion_sync_handle_settings_save');
+add_action('admin_post_notion_sync_now', 'notion_sync_handle_sync_now');
+
+function notion_sync_is_constant_locked($key){
+    $map = [
+        'api_token'  => 'NOTION_API_TOKEN',
+        'database_id'=> 'NOTION_DATABASE_ID',
+        'prop_title' => 'PROP_TITLE',
+        'prop_status'=> 'PROP_STATUS',
+        'status_equals' => 'STATUS_EQUALS',
+        'status_to_change' => 'STATUS_TO_CHANGE',
+    ];
+    $c = $map[$key] ?? '';
+    return $c && defined($c) && constant($c);
+}
+
+function notion_sync_handle_settings_save(){
+    if (!current_user_can('manage_options')) wp_die('Forbidden');
+    check_admin_referer('notion_sync_save', '_wpnonce_notion_sync');
+
+    $fields = ['api_token','database_id','prop_title','prop_status','status_equals','status_to_change','schedule','post_status'];
+    foreach ($fields as $f){
+        if (notion_sync_is_constant_locked($f)) continue; // constant overrides
+        $val = isset($_POST[$f]) ? sanitize_text_field(wp_unslash($_POST[$f])) : '';
+        if ($f === 'schedule'){
+            // validate schedule key
+            $schedules = wp_get_schedules();
+            if (!isset($schedules[$val])) { $val = 'hourly'; }
+        } elseif ($f === 'post_status'){
+            $allowed = ['publish','draft','pending','private'];
+            $val = strtolower($val);
+            if (!in_array($val, $allowed, true)) { $val = DEFAULT_POST_STATUS; }
+        }
+        update_option('notion_sync_'.$f, $val);
+    }
+
+    // reschedule cron with new recurrence
+    $rec = ns_schedule_recurrence();
+    wp_clear_scheduled_hook('notion_sync_hourly');
+    wp_schedule_event(time()+60, $rec, 'notion_sync_hourly');
+
+    wp_safe_redirect(add_query_arg('updated', '1', wp_get_referer() ?: admin_url('options-general.php?page=notion-sync')));
+    exit;
+}
+
+function notion_sync_handle_sync_now(){
+    if (!current_user_can('manage_options')) wp_die('Forbidden');
+    check_admin_referer('notion_sync_now', '_wpnonce_notion_sync_now');
+
+    // Run sync immediately (verbose logs enabled)
+    global $notion_sync_request_logs; $notion_sync_request_logs = [];
+    ns_log('Manual sync requested by user #'.get_current_user_id());
+    notion_sync_run(true);
+    // Persist logs temporarily for display after redirect
+    if (is_array($notion_sync_request_logs) && !empty($notion_sync_request_logs)){
+        set_transient('notion_sync_last_logs_'.get_current_user_id(), $notion_sync_request_logs, 5 * MINUTE_IN_SECONDS);
+    }
+
+    wp_safe_redirect(add_query_arg('synced', '1', wp_get_referer() ?: admin_url('options-general.php?page=notion-sync')));
+    exit;
+}
+
+function notion_sync_render_settings_page(){
+    if (!current_user_can('manage_options')) return;
+
+    $vals = [
+        'api_token'   => ns_api_token(),
+        'database_id' => ns_database_id(),
+        'prop_title'  => ns_prop_title(),
+        'prop_status' => ns_prop_status(),
+        'status_equals' => ns_status_equals(),
+        'status_to_change' => ns_status_to_change(),
+        'post_status' => ns_post_status(),
+        'schedule'    => ns_schedule_recurrence(),
+    ];
+    $locked = [
+        'api_token'   => notion_sync_is_constant_locked('api_token'),
+        'database_id' => notion_sync_is_constant_locked('database_id'),
+        'prop_title'  => notion_sync_is_constant_locked('prop_title'),
+        'prop_status' => notion_sync_is_constant_locked('prop_status'),
+        'status_equals' => notion_sync_is_constant_locked('status_equals'),
+        'status_to_change' => notion_sync_is_constant_locked('status_to_change'),
+        'post_status' => false,
+    ];
+    $schedules = wp_get_schedules();
+    $preferred = ['every_5_minutes','every_15_minutes','every_30_minutes','hourly','twicedaily','daily'];
+    $ordered = array_values(array_unique(array_merge($preferred, array_keys($schedules))));
+    ?>
+    <div class="wrap">
+        <h1>Notion Sync Settings</h1>
+        <?php if (!empty($_GET['updated'])): ?>
+            <div class="notice notice-success is-dismissible"><p>Settings saved.</p></div>
+        <?php endif; ?>
+        <?php if (!empty($_GET['synced'])): ?>
+            <div class="notice notice-success is-dismissible"><p>Sync completed.</p></div>
+        <?php endif; ?>
+        <?php
+        $log_key = 'notion_sync_last_logs_'.get_current_user_id();
+        $logs = get_transient($log_key);
+        if ($logs && is_array($logs)){
+            delete_transient($log_key);
+            $joined = esc_html(implode("\n", $logs));
+            echo '<div class="notice notice-info"><p><strong>Sync Logs</strong></p><pre style="white-space:pre-wrap;max-height:320px;overflow:auto;margin:0">'.$joined.'</pre></div>';
+        }
+        ?>
+
+        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+            <?php wp_nonce_field('notion_sync_save','_wpnonce_notion_sync'); ?>
+            <input type="hidden" name="action" value="notion_sync_save">
+
+            <table class="form-table" role="presentation">
+                <tbody>
+                <tr>
+                    <th scope="row"><label for="api_token">Notion API Token</label></th>
+                    <td>
+                        <input name="api_token" id="api_token" type="password" class="regular-text" value="<?php echo esc_attr($vals['api_token']); ?>" <?php disabled($locked['api_token']); ?> placeholder="secret_xxx">
+                        <p class="description">Bearer token from Notion Integrations. <?php if ($locked['api_token']) echo 'Defined via NOTION_API_TOKEN constant.'; ?></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="post_status">WordPress Post Status</label></th>
+                    <td>
+                        <select name="post_status" id="post_status" <?php disabled($locked['post_status']); ?>>
+                            <option value="publish" <?php selected($vals['post_status'], 'publish'); ?>>Publish</option>
+                            <option value="draft" <?php selected($vals['post_status'], 'draft'); ?>>Draft</option>
+                            <option value="pending" <?php selected($vals['post_status'], 'pending'); ?>>Pending Review</option>
+                            <option value="private" <?php selected($vals['post_status'], 'private'); ?>>Private</option>
+                        </select>
+                        <p class="description">Status applied to posts created or updated by sync.</p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="schedule">Schedule Frequency</label></th>
+                    <td>
+                        <select name="schedule" id="schedule">
+                            <?php foreach ($ordered as $key): if (!isset($schedules[$key])) continue; ?>
+                                <option value="<?php echo esc_attr($key); ?>" <?php selected($vals['schedule'], $key); ?>>
+                                    <?php echo esc_html($schedules[$key]['display'] . ' ('. $key .')'); ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="database_id">Notion Database ID</label></th>
+                    <td>
+                        <label for="database_id">Notion Database ID</label><br>
+                        <input name="database_id" id="database_id" type="text" class="regular-text" value="<?php echo esc_attr($vals['database_id']); ?>" <?php disabled($locked['database_id']); ?> placeholder="32-char ID">
+                        <p class="description">Found in the database URL. <?php if ($locked['database_id']) echo 'Defined via NOTION_DATABASE_ID constant.'; ?></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="prop_title">Title Property Name</label></th>
+                    <td>
+                        <input name="prop_title" id="prop_title" type="text" class="regular-text" value="<?php echo esc_attr($vals['prop_title']); ?>" <?php disabled($locked['prop_title']); ?> placeholder="Name">
+                        <p class="description">Notion property used as post title (type: title). <?php if ($locked['prop_title']) echo 'Defined via PROP_TITLE constant.'; ?></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="prop_status">Status Property Name</label></th>
+                    <td>
+                        <input name="prop_status" id="prop_status" type="text" class="regular-text" value="<?php echo esc_attr($vals['prop_status']); ?>" <?php disabled($locked['prop_status']); ?> placeholder="Status">
+                        <p class="description">Notion status property used to filter synced items. <?php if ($locked['prop_status']) echo 'Defined via PROP_STATUS constant.'; ?></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="status_equals">Current Status</label></th>
+                    <td>
+                        <input name="status_equals" id="status_equals" type="text" class="regular-text" value="<?php echo esc_attr($vals['status_equals']); ?>" <?php disabled($locked['status_equals']); ?> placeholder="Ready public">
+                        <p class="description">Only records where the status equals this value will sync. <?php if ($locked['status_equals']) echo 'Defined via STATUS_EQUALS constant.'; ?></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="status_to_change">Status to Change</label></th>
+                    <td>
+                        <input name="status_to_change" id="status_to_change" type="text" class="regular-text" value="<?php echo esc_attr($vals['status_to_change']); ?>" <?php disabled($locked['status_to_change']); ?> placeholder="แชร์บนเว็บ">
+                        <p class="description">After a successful sync, set the Notion status to this value. <?php if ($locked['status_to_change']) echo 'Defined via STATUS_TO_CHANGE constant.'; ?></p>
+                    </td>
+                </tr>
+                </tbody>
+            </table>
+
+            <?php submit_button('Save Changes'); ?>
+        </form>
+
+        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-top:12px;">
+            <?php wp_nonce_field('notion_sync_now','_wpnonce_notion_sync_now'); ?>
+            <input type="hidden" name="action" value="notion_sync_now">
+            <?php submit_button('Sync Now', 'secondary', 'submit', false); ?>
+        </form>
+    </div>
+    <?php
+}
+
+// Settings link on Plugins screen
+add_filter('plugin_action_links_' . plugin_basename(__FILE__), function($links){
+    $url = admin_url('options-general.php?page=notion-sync');
+    $links[] = '<a href="'.esc_url($url).'">'.esc_html__('Settings').'</a>';
+    return $links;
+});

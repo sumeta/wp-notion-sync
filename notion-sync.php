@@ -362,8 +362,15 @@ function notion_request($path,$method='GET',$body=null){
 
 // ====== Property helpers ======
 function notion_read_title($titleProp){
-    if (!$titleProp || ($titleProp['type']??'')!=='title') return '';
-    return notion_rich_text_plain($titleProp['title'] ?? []);
+    if (!$titleProp) return '';
+    $type = $titleProp['type'] ?? '';
+    if ($type === 'title') {
+        return notion_rich_text_plain($titleProp['title'] ?? []);
+    }
+    if ($type === 'rich_text') {
+        return notion_rich_text_plain($titleProp['rich_text'] ?? []);
+    }
+    return '';
 }
 function notion_rich_text_plain($arr){
     $s=''; foreach((array)$arr as $rt){ $s .= ($rt['plain_text'] ?? ''); } return trim($s);

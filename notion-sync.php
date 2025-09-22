@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Notion Sync
 * Description: Sync Notion Database → WordPress (Free). Supports blocks: heading_1/2/3, paragraph, bulleted_list_item, numbered_list_item, quote, code, to_do, toggle, divider, image. Images are stored in Media Library and content updates automatically.
- * Version:     0.2.0
+ * Version:     0.3.2
  * Author:      Sumeta.P
  */
 
@@ -15,6 +15,8 @@ const NOTION_API_VERSION  = '2022-06-28';
 // Property names in the Notion Database
 const PROP_TITLE          = '';          // type: title
 const PROP_STATUS         = '';        // type: status (filter by Ready public)
+const PROP_TAGS           = '';        // type: multi_select or select (tags)
+const PROP_CATEGORIES     = '';        // type: multi_select or select (categories)
 const STATUS_EQUALS       = '';  // Only sync records with this value
 const STATUS_TO_CHANGE    = '';  // Set to this status after successful sync
 
@@ -40,6 +42,14 @@ function ns_prop_title(){
 function ns_prop_status(){
     if (defined('PROP_STATUS') && PROP_STATUS) return PROP_STATUS;
     return ns_get_option('prop_status', 'Status');
+}
+function ns_prop_tags(){
+    if (defined('PROP_TAGS') && PROP_TAGS) return PROP_TAGS;
+    return ns_get_option('prop_tags', 'Tags');
+}
+function ns_prop_categories(){
+    if (defined('PROP_CATEGORIES') && PROP_CATEGORIES) return PROP_CATEGORIES;
+    return ns_get_option('prop_categories', 'Categories');
 }
 function ns_status_equals(){
     if (defined('STATUS_EQUALS') && STATUS_EQUALS) return STATUS_EQUALS;
@@ -168,6 +178,52 @@ function notion_sync_run($verbose=false){
 
         update_post_meta($post_id, '_notion_last_edited', $editedAt);
         if($verbose) ns_log("synced $pageId -> post#$post_id");
+
+        // Apply tags from Notion property only
+        $tagPropName = ns_prop_tags();
+        if ($tagPropName) {
+            if (!array_key_exists($tagPropName, (array)$props)) {
+                ns_log('tags prop not found: ' . $tagPropName . ' | available: ' . implode(', ', array_keys((array)$props)));
+            }
+            $tags = notion_read_tags($props[$tagPropName] ?? null);
+            if ($tags !== null) { // null means property missing; [] means explicitly empty
+                ns_log('parsed tags: '.(empty($tags)?'(empty)':implode(', ', $tags)));
+                $res = wp_set_post_tags($post_id, $tags, false);
+                if (is_wp_error($res)) {
+                    ns_log('wp_set_post_tags error: '.$res->get_error_message());
+                } else {
+                    ns_log('wp_set_post_tags ids: '.implode(', ', array_map('strval', (array)$res)));
+                }
+                // Log current terms state
+                $cur = get_the_terms($post_id, 'post_tag');
+                if (is_wp_error($cur)) ns_log('get_the_terms(post_tag) error: '.$cur->get_error_message());
+                else ns_log('current tags now: '.(empty($cur)?'(none)':implode(', ', array_map(function($t){ return $t->name; }, (array)$cur))));
+            }
+        }
+
+        // Apply categories from Notion property only
+        $catPropName = ns_prop_categories();
+        if ($catPropName) {
+            if (!array_key_exists($catPropName, (array)$props)) {
+                ns_log('category prop not found: ' . $catPropName . ' | available: ' . implode(', ', array_keys((array)$props)));
+            }
+            $cats = notion_read_categories($props[$catPropName] ?? null);
+            if ($cats !== null) {
+                ns_log('parsed categories: '.(empty($cats)?'(empty)':implode(', ', $cats)));
+                // Ensure category terms exist and assign by IDs
+                $cat_ids = ns_ensure_terms($cats, 'category');
+                ns_log('ensure category ids: '.(empty($cat_ids)?'(none)':implode(', ', array_map('strval', (array)$cat_ids))));
+                $res2 = wp_set_post_terms($post_id, $cat_ids, 'category', false);
+                if (is_wp_error($res2)) {
+                    ns_log('wp_set_post_terms(category) error: '.$res2->get_error_message());
+                } else {
+                    ns_log('wp_set_post_terms(category) ids: '.implode(', ', array_map('strval', (array)$res2)));
+                }
+                $cur2 = get_the_terms($post_id, 'category');
+                if (is_wp_error($cur2)) ns_log('get_the_terms(category) error: '.$cur2->get_error_message());
+                else ns_log('current categories now: '.(empty($cur2)?'(none)':implode(', ', array_map(function($t){ return $t->name; }, (array)$cur2))));
+            }
+        }
 
         // After successful sync, update Notion Status to configured value
         notion_update_page_status($pageId, ns_status_to_change());
@@ -394,6 +450,83 @@ function notion_rich_text_html($arr){
     return $h;
 }
 
+// Read Notion tags property into array of strings
+// Returns null if property missing; [] if present but empty; or [names]
+function notion_read_tags($prop){
+    if ($prop === null) return null;
+    $type = $prop['type'] ?? '';
+    $out = [];
+    if ($type === 'multi_select'){
+        foreach ((array)($prop['multi_select'] ?? []) as $it){
+            $name = trim((string)($it['name'] ?? ''));
+            if ($name !== '') $out[] = $name;
+        }
+        return $out;
+    }
+    if ($type === 'select'){
+        $name = trim((string)($prop['select']['name'] ?? ''));
+        return $name!=='' ? [$name] : [];
+    }
+    if ($type === 'rich_text'){
+        // Support comma-separated in rich text
+        $txt = notion_rich_text_plain($prop['rich_text'] ?? []);
+        if ($txt === '') return [];
+        $parts = array_map('trim', preg_split('/[,;]+/', $txt));
+        $parts = array_values(array_filter($parts, function($s){ return $s !== ''; }));
+        return $parts;
+    }
+    return [];
+}
+
+// Read Notion categories property into array of strings
+// Returns null if property missing; [] if present but empty; or [names]
+function notion_read_categories($prop){
+    if ($prop === null) return null;
+    $type = $prop['type'] ?? '';
+    $out = [];
+    if ($type === 'multi_select'){
+        foreach ((array)($prop['multi_select'] ?? []) as $it){
+            $name = trim((string)($it['name'] ?? ''));
+            if ($name !== '') $out[] = $name;
+        }
+        return $out;
+    }
+    if ($type === 'select'){
+        $name = trim((string)($prop['select']['name'] ?? ''));
+        return $name!=='' ? [$name] : [];
+    }
+    if ($type === 'rich_text'){
+        $txt = notion_rich_text_plain($prop['rich_text'] ?? []);
+        if ($txt === '') return [];
+        $parts = array_map('trim', preg_split('/[,;]+/', $txt));
+        $parts = array_values(array_filter($parts, function($s){ return $s !== ''; }));
+        return $parts;
+    }
+    return [];
+}
+
+// Ensure terms exist for a given taxonomy and return their IDs
+function ns_ensure_terms(array $names, $taxonomy){
+    $ids = [];
+    foreach ($names as $name){
+        $name = trim((string)$name);
+        if ($name === '') continue;
+        $exists = term_exists($name, $taxonomy);
+        if ($exists && !is_wp_error($exists)){
+            $tid = is_array($exists) ? intval($exists['term_id'] ?? 0) : intval($exists);
+            if ($tid) { $ids[] = $tid; continue; }
+        }
+        $created = wp_insert_term($name, $taxonomy);
+        if (is_wp_error($created)){
+            ns_log("wp_insert_term($taxonomy) error for '$name': ".$created->get_error_message());
+            continue;
+        }
+        $tid = intval($created['term_id'] ?? 0);
+        if ($tid) $ids[] = $tid;
+    }
+    return $ids;
+}
+
 // Update a Notion page Status property to a specific status name
 function notion_update_page_status($pageId, $statusName){
     $propName = ns_prop_status();
@@ -477,6 +610,8 @@ function notion_sync_is_constant_locked($key){
         'database_id'=> 'NOTION_DATABASE_ID',
         'prop_title' => 'PROP_TITLE',
         'prop_status'=> 'PROP_STATUS',
+        'prop_tags'  => 'PROP_TAGS',
+        'prop_categories' => 'PROP_CATEGORIES',
         'status_equals' => 'STATUS_EQUALS',
         'status_to_change' => 'STATUS_TO_CHANGE',
     ];
@@ -488,7 +623,7 @@ function notion_sync_handle_settings_save(){
     if (!current_user_can('manage_options')) wp_die('Forbidden');
     check_admin_referer('notion_sync_save', '_wpnonce_notion_sync');
 
-    $fields = ['api_token','database_id','prop_title','prop_status','status_equals','status_to_change','schedule','post_status'];
+    $fields = ['api_token','database_id','prop_title','prop_status','prop_tags','prop_categories','status_equals','status_to_change','schedule','post_status'];
     foreach ($fields as $f){
         if (notion_sync_is_constant_locked($f)) continue; // constant overrides
         $val = isset($_POST[$f]) ? sanitize_text_field(wp_unslash($_POST[$f])) : '';
@@ -538,6 +673,8 @@ function notion_sync_render_settings_page(){
         'database_id' => ns_database_id(),
         'prop_title'  => ns_prop_title(),
         'prop_status' => ns_prop_status(),
+        'prop_tags'   => ns_prop_tags(),
+        'prop_categories' => ns_prop_categories(),
         'status_equals' => ns_status_equals(),
         'status_to_change' => ns_status_to_change(),
         'post_status' => ns_post_status(),
@@ -548,6 +685,8 @@ function notion_sync_render_settings_page(){
         'database_id' => notion_sync_is_constant_locked('database_id'),
         'prop_title'  => notion_sync_is_constant_locked('prop_title'),
         'prop_status' => notion_sync_is_constant_locked('prop_status'),
+        'prop_tags'   => notion_sync_is_constant_locked('prop_tags'),
+        'prop_categories' => notion_sync_is_constant_locked('prop_categories'),
         'status_equals' => notion_sync_is_constant_locked('status_equals'),
         'status_to_change' => notion_sync_is_constant_locked('status_to_change'),
         'post_status' => false,
@@ -631,6 +770,20 @@ function notion_sync_render_settings_page(){
                     <td>
                         <input name="prop_status" id="prop_status" type="text" class="regular-text" value="<?php echo esc_attr($vals['prop_status']); ?>" <?php disabled($locked['prop_status']); ?> placeholder="Status">
                         <p class="description">Notion status property used to filter synced items. <?php if ($locked['prop_status']) echo 'Defined via PROP_STATUS constant.'; ?></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="prop_tags">Tags Property Name</label></th>
+                    <td>
+                        <input name="prop_tags" id="prop_tags" type="text" class="regular-text" value="<?php echo esc_attr($vals['prop_tags']); ?>" <?php disabled($locked['prop_tags']); ?> placeholder="Tags">
+                        <p class="description">Notion property used as WordPress tags. Supports multi-select, select, or comma-separated rich text. <?php if ($locked['prop_tags']) echo 'Defined via PROP_TAGS constant.'; ?></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="prop_categories">Categories Property Name</label></th>
+                    <td>
+                        <input name="prop_categories" id="prop_categories" type="text" class="regular-text" value="<?php echo esc_attr($vals['prop_categories']); ?>" <?php disabled($locked['prop_categories']); ?> placeholder="Categories">
+                        <p class="description">Notion property used as WordPress categories. Supports multi-select, select, or comma-separated rich text. <?php if ($locked['prop_categories']) echo 'Defined via PROP_CATEGORIES constant.'; ?></p>
                     </td>
                 </tr>
                 <tr>

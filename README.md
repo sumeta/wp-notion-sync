@@ -7,7 +7,8 @@ Sync content from Notion Database into WordPress posts.
 - Images are sideloaded into Media Library  
 - Auto sync via WP-Cron (hourly) or `wp notion sync` (WP-CLI)
  - Tags mapping from Notion (multi-select / select / comma-separated text)
- - Categories mapping from Notion (multi-select / select / comma-separated text)
+- Categories mapping from Notion (multi-select / select / comma-separated text)
+ - Slug mapping from Notion (title / rich_text / formula string / url)
 
 ## Installation
 1. Clone into `wp-content/plugins/wp-notion-sync`
@@ -25,3 +26,8 @@ Sync content from Notion Database into WordPress posts.
 
 ### Categories (หมวดหมู่)
 - From Notion only: Add a property for categories (e.g., "Categories") and set "Categories Property Name" in plugin settings. The plugin reads multi-select, select, or comma-separated rich text and sets WordPress categories accordingly.
+
+### URL Slug
+- Add a Notion property (e.g., "Slug") and set "Slug Property Name" in plugin settings.
+- Supported property types: title, rich_text, formula (string), or url.
+- If provided, the value is sanitized and applied to WordPress `post_name` (the URL slug). If empty or missing, WordPress keeps/generates the default slug.

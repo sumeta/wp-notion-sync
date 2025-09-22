@@ -17,6 +17,7 @@ const PROP_TITLE          = '';          // type: title
 const PROP_STATUS         = '';        // type: status (filter by Ready public)
 const PROP_TAGS           = '';        // type: multi_select or select (tags)
 const PROP_CATEGORIES     = '';        // type: multi_select or select (categories)
+const PROP_SLUG          = '';        // type: rich_text/title (URL slug)
 const STATUS_EQUALS       = '';  // Only sync records with this value
 const STATUS_TO_CHANGE    = '';  // Set to this status after successful sync
 
@@ -50,6 +51,10 @@ function ns_prop_tags(){
 function ns_prop_categories(){
     if (defined('PROP_CATEGORIES') && PROP_CATEGORIES) return PROP_CATEGORIES;
     return ns_get_option('prop_categories', 'Categories');
+}
+function ns_prop_slug(){
+    if (defined('PROP_SLUG') && PROP_SLUG) return PROP_SLUG;
+    return ns_get_option('prop_slug', 'Slug');
 }
 function ns_status_equals(){
     if (defined('STATUS_EQUALS') && STATUS_EQUALS) return STATUS_EQUALS;
@@ -157,12 +162,31 @@ function notion_sync_run($verbose=false){
         // Render basic blocks
         $contentHtml = notion_render_page_to_html($pageId);
 
+        // Prepare post payload
         $postarr = [
             'post_title'   => $title,
             'post_content' => $contentHtml,
             'post_status'  => $post_status,
             'post_type'    => TARGET_POST_TYPE,
         ];
+
+        // Optional slug from Notion property
+        $slugPropName = ns_prop_slug();
+        if ($slugPropName) {
+            if (!array_key_exists($slugPropName, (array)$props)) {
+                ns_log('slug prop not found: ' . $slugPropName . ' | available: ' . implode(', ', array_keys((array)$props)));
+            }
+            $slugRaw = notion_read_slug($props[$slugPropName] ?? null);
+            if ($slugRaw !== null) {
+                $slug = sanitize_title($slugRaw);
+                if ($slug !== '') {
+                    $postarr['post_name'] = $slug;
+                    ns_log('apply slug: '.$slug);
+                } else {
+                    ns_log('slug present but empty after sanitize, skip');
+                }
+            }
+        }
 
         if ($existing) {
             $postarr['ID'] = $existing->ID;
@@ -450,6 +474,29 @@ function notion_rich_text_html($arr){
     return $h;
 }
 
+// Read Notion slug property into a single string
+// Returns null if property missing; '' is allowed but will be ignored after sanitize
+function notion_read_slug($prop){
+    if ($prop === null) return null;
+    $type = $prop['type'] ?? '';
+    if ($type === 'title'){
+        return notion_rich_text_plain($prop['title'] ?? []);
+    }
+    if ($type === 'rich_text'){
+        return notion_rich_text_plain($prop['rich_text'] ?? []);
+    }
+    if ($type === 'formula'){
+        $f = $prop['formula'] ?? [];
+        if (($f['type'] ?? '') === 'string') return trim((string)($f['string'] ?? ''));
+        return '';
+    }
+    if ($type === 'url'){
+        // If user stores a path or URL, take it as-is and sanitize later
+        return trim((string)($prop['url'] ?? ''));
+    }
+    return '';
+}
+
 // Read Notion tags property into array of strings
 // Returns null if property missing; [] if present but empty; or [names]
 function notion_read_tags($prop){
@@ -612,6 +659,7 @@ function notion_sync_is_constant_locked($key){
         'prop_status'=> 'PROP_STATUS',
         'prop_tags'  => 'PROP_TAGS',
         'prop_categories' => 'PROP_CATEGORIES',
+        'prop_slug'  => 'PROP_SLUG',
         'status_equals' => 'STATUS_EQUALS',
         'status_to_change' => 'STATUS_TO_CHANGE',
     ];
@@ -623,7 +671,7 @@ function notion_sync_handle_settings_save(){
     if (!current_user_can('manage_options')) wp_die('Forbidden');
     check_admin_referer('notion_sync_save', '_wpnonce_notion_sync');
 
-    $fields = ['api_token','database_id','prop_title','prop_status','prop_tags','prop_categories','status_equals','status_to_change','schedule','post_status'];
+    $fields = ['api_token','database_id','prop_title','prop_status','prop_tags','prop_categories','prop_slug','status_equals','status_to_change','schedule','post_status'];
     foreach ($fields as $f){
         if (notion_sync_is_constant_locked($f)) continue; // constant overrides
         $val = isset($_POST[$f]) ? sanitize_text_field(wp_unslash($_POST[$f])) : '';
@@ -675,6 +723,7 @@ function notion_sync_render_settings_page(){
         'prop_status' => ns_prop_status(),
         'prop_tags'   => ns_prop_tags(),
         'prop_categories' => ns_prop_categories(),
+        'prop_slug'   => ns_prop_slug(),
         'status_equals' => ns_status_equals(),
         'status_to_change' => ns_status_to_change(),
         'post_status' => ns_post_status(),
@@ -687,6 +736,7 @@ function notion_sync_render_settings_page(){
         'prop_status' => notion_sync_is_constant_locked('prop_status'),
         'prop_tags'   => notion_sync_is_constant_locked('prop_tags'),
         'prop_categories' => notion_sync_is_constant_locked('prop_categories'),
+        'prop_slug'   => notion_sync_is_constant_locked('prop_slug'),
         'status_equals' => notion_sync_is_constant_locked('status_equals'),
         'status_to_change' => notion_sync_is_constant_locked('status_to_change'),
         'post_status' => false,
@@ -777,6 +827,13 @@ function notion_sync_render_settings_page(){
                     <td>
                         <input name="prop_tags" id="prop_tags" type="text" class="regular-text" value="<?php echo esc_attr($vals['prop_tags']); ?>" <?php disabled($locked['prop_tags']); ?> placeholder="Tags">
                         <p class="description">Notion property used as WordPress tags. Supports multi-select, select, or comma-separated rich text. <?php if ($locked['prop_tags']) echo 'Defined via PROP_TAGS constant.'; ?></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="prop_slug">Slug Property Name</label></th>
+                    <td>
+                        <input name="prop_slug" id="prop_slug" type="text" class="regular-text" value="<?php echo esc_attr($vals['prop_slug']); ?>" <?php disabled($locked['prop_slug']); ?> placeholder="Slug">
+                        <p class="description">Notion property used as WordPress URL slug. Supports title, rich_text, formula(string), or url.</p>
                     </td>
                 </tr>
                 <tr>

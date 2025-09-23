@@ -18,6 +18,7 @@ const PROP_STATUS         = '';        // type: status (filter by Ready public)
 const PROP_TAGS           = '';        // type: multi_select or select (tags)
 const PROP_CATEGORIES     = '';        // type: multi_select or select (categories)
 const PROP_SLUG          = '';        // type: rich_text/title (URL slug)
+const PROP_FEATURED_IMAGE = '';       // type: files (Files & media) for featured image
 const STATUS_EQUALS       = '';  // Only sync records with this value
 const STATUS_TO_CHANGE    = '';  // Set to this status after successful sync
 
@@ -55,6 +56,10 @@ function ns_prop_categories(){
 function ns_prop_slug(){
     if (defined('PROP_SLUG') && PROP_SLUG) return PROP_SLUG;
     return ns_get_option('prop_slug', 'Slug');
+}
+function ns_prop_featured_image(){
+    if (defined('PROP_FEATURED_IMAGE') && PROP_FEATURED_IMAGE) return PROP_FEATURED_IMAGE;
+    return ns_get_option('prop_featured_image', '');
 }
 function ns_status_equals(){
     if (defined('STATUS_EQUALS') && STATUS_EQUALS) return STATUS_EQUALS;
@@ -202,6 +207,36 @@ function notion_sync_run($verbose=false){
 
         update_post_meta($post_id, '_notion_last_edited', $editedAt);
         if($verbose) ns_log("synced $pageId -> post#$post_id");
+
+        // Featured image from Notion Files & media (first file)
+        $featPropName = ns_prop_featured_image();
+        if ($featPropName) {
+            if (!array_key_exists($featPropName, (array)$props)) {
+                ns_log('featured image prop not found: ' . $featPropName . ' | available: ' . implode(', ', array_keys((array)$props)));
+            }
+            $file = notion_read_first_file($props[$featPropName] ?? null);
+            if ($file === null) {
+                // Property not present: do nothing
+            } elseif ($file === false) {
+                // Explicitly empty: remove featured image if exists
+                if (has_post_thumbnail($post_id)) {
+                    delete_post_thumbnail($post_id);
+                    ns_log('removed featured image (empty files property)');
+                }
+            } else {
+                $url = $file['url'];
+                $name = $file['name'];
+                if ($url) {
+                    $aid = notion_media_sideload_by_url($url, $post_id, $name);
+                    if (is_wp_error($aid)) {
+                        ns_log('featured image sideload error: '.$aid->get_error_message());
+                    } else {
+                        set_post_thumbnail($post_id, $aid);
+                        ns_log('set featured image attachment#'.$aid.' from '.$featPropName);
+                    }
+                }
+            }
+        }
 
         // Apply tags from Notion property only
         $tagPropName = ns_prop_tags();
@@ -474,6 +509,29 @@ function notion_rich_text_html($arr){
     return $h;
 }
 
+// Read first file from a Notion Files & media property
+// Returns:
+// - null if property missing
+// - false if property present but empty
+// - ['url'=>string, 'name'=>string] for the first file/external
+function notion_read_first_file($prop){
+    if ($prop === null) return null;
+    $type = $prop['type'] ?? '';
+    if ($type !== 'files') return false;
+    $items = (array)($prop['files'] ?? []);
+    if (empty($items)) return false;
+    $first = $items[0];
+    $name = trim((string)($first['name'] ?? ''));
+    $ftype = $first['type'] ?? '';
+    if ($ftype === 'external') {
+        $url = trim((string)($first['external']['url'] ?? ''));
+    } else { // 'file'
+        $url = trim((string)($first['file']['url'] ?? ''));
+    }
+    if ($url === '') return false;
+    return ['url'=>$url, 'name'=>$name ?: ''];
+}
+
 // Read Notion slug property into a single string
 // Returns null if property missing; '' is allowed but will be ignored after sanitize
 function notion_read_slug($prop){
@@ -660,6 +718,7 @@ function notion_sync_is_constant_locked($key){
         'prop_tags'  => 'PROP_TAGS',
         'prop_categories' => 'PROP_CATEGORIES',
         'prop_slug'  => 'PROP_SLUG',
+        'prop_featured_image' => 'PROP_FEATURED_IMAGE',
         'status_equals' => 'STATUS_EQUALS',
         'status_to_change' => 'STATUS_TO_CHANGE',
     ];
@@ -671,7 +730,7 @@ function notion_sync_handle_settings_save(){
     if (!current_user_can('manage_options')) wp_die('Forbidden');
     check_admin_referer('notion_sync_save', '_wpnonce_notion_sync');
 
-    $fields = ['api_token','database_id','prop_title','prop_status','prop_tags','prop_categories','prop_slug','status_equals','status_to_change','schedule','post_status'];
+    $fields = ['api_token','database_id','prop_title','prop_status','prop_tags','prop_categories','prop_slug','prop_featured_image','status_equals','status_to_change','schedule','post_status'];
     foreach ($fields as $f){
         if (notion_sync_is_constant_locked($f)) continue; // constant overrides
         $val = isset($_POST[$f]) ? sanitize_text_field(wp_unslash($_POST[$f])) : '';
@@ -724,6 +783,7 @@ function notion_sync_render_settings_page(){
         'prop_tags'   => ns_prop_tags(),
         'prop_categories' => ns_prop_categories(),
         'prop_slug'   => ns_prop_slug(),
+        'prop_featured_image' => ns_prop_featured_image(),
         'status_equals' => ns_status_equals(),
         'status_to_change' => ns_status_to_change(),
         'post_status' => ns_post_status(),
@@ -737,6 +797,7 @@ function notion_sync_render_settings_page(){
         'prop_tags'   => notion_sync_is_constant_locked('prop_tags'),
         'prop_categories' => notion_sync_is_constant_locked('prop_categories'),
         'prop_slug'   => notion_sync_is_constant_locked('prop_slug'),
+        'prop_featured_image' => notion_sync_is_constant_locked('prop_featured_image'),
         'status_equals' => notion_sync_is_constant_locked('status_equals'),
         'status_to_change' => notion_sync_is_constant_locked('status_to_change'),
         'post_status' => false,
@@ -834,6 +895,13 @@ function notion_sync_render_settings_page(){
                     <td>
                         <input name="prop_slug" id="prop_slug" type="text" class="regular-text" value="<?php echo esc_attr($vals['prop_slug']); ?>" <?php disabled($locked['prop_slug']); ?> placeholder="Slug">
                         <p class="description">Notion property used as WordPress URL slug. Supports title, rich_text, formula(string), or url.</p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="prop_featured_image">Featured Image Property Name</label></th>
+                    <td>
+                        <input name="prop_featured_image" id="prop_featured_image" type="text" class="regular-text" value="<?php echo esc_attr($vals['prop_featured_image']); ?>" <?php disabled($locked['prop_featured_image']); ?> placeholder="Cover / Image / Files">
+                        <p class="description">Notion Files &amp; media property used as the post's featured image (first file is used). <?php if ($locked['prop_featured_image']) echo 'Defined via PROP_FEATURED_IMAGE constant.'; ?></p>
                     </td>
                 </tr>
                 <tr>

@@ -9,7 +9,8 @@ Sync content from Notion Database into WordPress posts.
  - Tags mapping from Notion (multi-select / select / comma-separated text)
 - Categories mapping from Notion (multi-select / select / comma-separated text)
 - Slug mapping from Notion (title / rich_text / formula string / url)
- - Featured image from Notion Files & media (first file)
+- Featured image from Notion Files & media (first file)
+ - Writeback WordPress URL to Notion
 
 ## Installation
 1. Clone into `wp-content/plugins/wp-notion-sync`
@@ -37,3 +38,8 @@ Sync content from Notion Database into WordPress posts.
 - Add a Notion property of type "Files & media" (e.g., "Cover").
 - Set "Featured Image Property Name" in plugin settings to this property name.
 - On sync, the plugin takes the first file in that property and sets it as the WordPress post featured image. If the property is present but empty, the current featured image is removed.
+
+### Writeback WordPress URL → Notion
+- Add a Notion property (recommended type: URL), e.g., "WP URL".
+- Set "Writeback URL Property Name" in plugin settings to that property name.
+- After a successful sync, the plugin updates that property on the Notion page with the post's full permalink. If the Notion property is rich_text or title, the URL is written as text.

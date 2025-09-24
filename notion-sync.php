@@ -19,6 +19,7 @@ const PROP_TAGS           = '';        // type: multi_select or select (tags)
 const PROP_CATEGORIES     = '';        // type: multi_select or select (categories)
 const PROP_SLUG          = '';        // type: rich_text/title (URL slug)
 const PROP_FEATURED_IMAGE = '';       // type: files (Files & media) for featured image
+const PROP_WP_URL        = '';       // type: url or rich_text/title (writeback permalink)
 const STATUS_EQUALS       = '';  // Only sync records with this value
 const STATUS_TO_CHANGE    = '';  // Set to this status after successful sync
 
@@ -60,6 +61,10 @@ function ns_prop_slug(){
 function ns_prop_featured_image(){
     if (defined('PROP_FEATURED_IMAGE') && PROP_FEATURED_IMAGE) return PROP_FEATURED_IMAGE;
     return ns_get_option('prop_featured_image', '');
+}
+function ns_prop_wp_url(){
+    if (defined('PROP_WP_URL') && PROP_WP_URL) return PROP_WP_URL;
+    return ns_get_option('prop_wp_url', '');
 }
 function ns_status_equals(){
     if (defined('STATUS_EQUALS') && STATUS_EQUALS) return STATUS_EQUALS;
@@ -282,6 +287,13 @@ function notion_sync_run($verbose=false){
                 if (is_wp_error($cur2)) ns_log('get_the_terms(category) error: '.$cur2->get_error_message());
                 else ns_log('current categories now: '.(empty($cur2)?'(none)':implode(', ', array_map(function($t){ return $t->name; }, (array)$cur2))));
             }
+        }
+
+        // Write back WordPress permalink to Notion (if configured)
+        $wp_url_prop = ns_prop_wp_url();
+        if ($wp_url_prop) {
+            $permalink = get_permalink($post_id);
+            notion_update_page_wp_url($pageId, $wp_url_prop, $props, $permalink);
         }
 
         // After successful sync, update Notion Status to configured value
@@ -652,6 +664,38 @@ function notion_update_page_status($pageId, $statusName){
     }
 }
 
+// Update a Notion property with the WordPress permalink
+// - If property type is url: sets url
+// - If rich_text: writes as text content
+// - If title: writes as title text
+function notion_update_page_wp_url($pageId, $propName, $props, $url){
+    if (!$propName) { ns_log('skip wp url writeback: empty property name'); return; }
+    if (!$url) { ns_log('skip wp url writeback: empty url'); return; }
+    if (!is_array($props) || !array_key_exists($propName, $props)){
+        ns_log('wp url writeback: property not found: '.$propName);
+        return;
+    }
+    $ptype = $props[$propName]['type'] ?? '';
+    if (!$ptype){ ns_log('wp url writeback: property has no type: '.$propName); return; }
+
+    $payloadProp = null;
+    if ($ptype === 'url'){
+        $payloadProp = [ 'url' => $url ];
+    } elseif ($ptype === 'rich_text'){
+        $payloadProp = [ 'rich_text' => [[ 'type'=>'text', 'text'=>['content'=>$url] ]] ];
+    } elseif ($ptype === 'title'){
+        $payloadProp = [ 'title' => [[ 'type'=>'text', 'text'=>['content'=>$url] ]] ];
+    } else {
+        // Fallback: attempt as url
+        $payloadProp = [ 'url' => $url ];
+    }
+
+    $payload = [ 'properties' => [ $propName => $payloadProp ] ];
+    $res = notion_request('pages/'.$pageId, 'PATCH', $payload);
+    if (!$res){ ns_log('failed to writeback WP URL to Notion'); }
+    else { ns_log('wrote WP URL back to Notion ('.$propName.')'); }
+}
+
 // ====== WordPress helpers ======
 function notion_find_post_by_page_id($pageId){
     $q = new WP_Query([
@@ -719,6 +763,7 @@ function notion_sync_is_constant_locked($key){
         'prop_categories' => 'PROP_CATEGORIES',
         'prop_slug'  => 'PROP_SLUG',
         'prop_featured_image' => 'PROP_FEATURED_IMAGE',
+        'prop_wp_url' => 'PROP_WP_URL',
         'status_equals' => 'STATUS_EQUALS',
         'status_to_change' => 'STATUS_TO_CHANGE',
     ];
@@ -730,7 +775,7 @@ function notion_sync_handle_settings_save(){
     if (!current_user_can('manage_options')) wp_die('Forbidden');
     check_admin_referer('notion_sync_save', '_wpnonce_notion_sync');
 
-    $fields = ['api_token','database_id','prop_title','prop_status','prop_tags','prop_categories','prop_slug','prop_featured_image','status_equals','status_to_change','schedule','post_status'];
+    $fields = ['api_token','database_id','prop_title','prop_status','prop_tags','prop_categories','prop_slug','prop_featured_image','prop_wp_url','status_equals','status_to_change','schedule','post_status'];
     foreach ($fields as $f){
         if (notion_sync_is_constant_locked($f)) continue; // constant overrides
         $val = isset($_POST[$f]) ? sanitize_text_field(wp_unslash($_POST[$f])) : '';
@@ -784,6 +829,7 @@ function notion_sync_render_settings_page(){
         'prop_categories' => ns_prop_categories(),
         'prop_slug'   => ns_prop_slug(),
         'prop_featured_image' => ns_prop_featured_image(),
+        'prop_wp_url' => ns_prop_wp_url(),
         'status_equals' => ns_status_equals(),
         'status_to_change' => ns_status_to_change(),
         'post_status' => ns_post_status(),
@@ -798,6 +844,7 @@ function notion_sync_render_settings_page(){
         'prop_categories' => notion_sync_is_constant_locked('prop_categories'),
         'prop_slug'   => notion_sync_is_constant_locked('prop_slug'),
         'prop_featured_image' => notion_sync_is_constant_locked('prop_featured_image'),
+        'prop_wp_url' => notion_sync_is_constant_locked('prop_wp_url'),
         'status_equals' => notion_sync_is_constant_locked('status_equals'),
         'status_to_change' => notion_sync_is_constant_locked('status_to_change'),
         'post_status' => false,
@@ -895,6 +942,13 @@ function notion_sync_render_settings_page(){
                     <td>
                         <input name="prop_slug" id="prop_slug" type="text" class="regular-text" value="<?php echo esc_attr($vals['prop_slug']); ?>" <?php disabled($locked['prop_slug']); ?> placeholder="Slug">
                         <p class="description">Notion property used as WordPress URL slug. Supports title, rich_text, formula(string), or url.</p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="prop_wp_url">Writeback URL Property Name</label></th>
+                    <td>
+                        <input name="prop_wp_url" id="prop_wp_url" type="text" class="regular-text" value="<?php echo esc_attr($vals['prop_wp_url']); ?>" <?php disabled($locked['prop_wp_url']); ?> placeholder="WP URL / Link / URL">
+                        <p class="description">Notion property to store the WordPress permalink after sync. Recommended type: <strong>URL</strong>. Also supports <strong>rich_text</strong> or <strong>title</strong>.</p>
                     </td>
                 </tr>
                 <tr>

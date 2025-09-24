@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Notion Sync
-* Description: Sync Notion Database → WordPress (Free). Supports blocks: heading_1/2/3, paragraph, bulleted_list_item, numbered_list_item, quote, code, to_do, toggle, divider, image. Images are stored in Media Library and content updates automatically.
- * Version:     0.3.2
+ * Description: Sync Notion Database → WordPress (Free). Supports blocks: heading_1/2/3, paragraph, bulleted_list_item, numbered_list_item, quote, code, to_do, toggle, divider, image, table, callout. Images are stored in Media Library and content updates automatically.
+ * Version:     0.3.3
  * Author:      Sumeta.P
  */
 
@@ -430,13 +430,74 @@ function notion_blocks_to_html(array $blocks){
                 break;
             }
 
+            case 'callout': {
+                $iconRaw = $data['icon'] ?? null;
+                $iconHtml = '';
+                if (is_array($iconRaw)){
+                    $itype = $iconRaw['type'] ?? '';
+                    if ($itype === 'emoji'){
+                        $emoji = trim((string)($iconRaw['emoji'] ?? ''));
+                        if ($emoji !== '') $iconHtml = '<span class="notion-callout-emoji">'.esc_html($emoji).'</span>';
+                    } elseif ($itype === 'external'){
+                        $u = $iconRaw['external']['url'] ?? '';
+                        if ($u) $iconHtml = '<img class="notion-callout-icon" src="'.esc_url($u).'" alt="">';
+                    } elseif ($itype === 'file'){
+                        $u = $iconRaw['file']['url'] ?? '';
+                        if ($u) $iconHtml = '<img class="notion-callout-icon" src="'.esc_url($u).'" alt="">';
+                    }
+                }
+                $color = trim((string)($data['color'] ?? 'default'));
+                $colorClass = $color !== '' ? ' notion-color-'.sanitize_html_class($color) : '';
+                $content = notion_rich_text_html($data['rich_text'] ?? []);
+                $out .= '<div class="notion-callout'.$colorClass.'">'
+                    . ($iconHtml ? '<div class="notion-callout-iconwrap">'.$iconHtml.'</div>' : '')
+                    . '<div class="notion-callout-content">'.$content;
+                if ($has_children) $out .= $render_children($block['id']);
+                $out .= '</div></div>';
+                break;
+            }
+
+            case 'table': {
+                $hasColHeader = !empty($data['has_column_header']);
+                $hasRowHeader = !empty($data['has_row_header']);
+                $rows = notion_list_children_all('blocks/'.$block['id'].'/children');
+
+                $out .= '<table class="notion-table">';
+
+                if ($hasColHeader && !empty($rows)) {
+                    $first = array_shift($rows);
+                    $cells = (array)($first['table_row']['cells'] ?? []);
+                    $out .= '<thead><tr>';
+                    foreach ($cells as $cell) {
+                        $out .= '<th>'.notion_rich_text_html($cell).'</th>';
+                    }
+                    $out .= '</tr></thead>';
+                }
+
+                $out .= '<tbody>';
+                foreach ((array)$rows as $row) {
+                    $cells = (array)($row['table_row']['cells'] ?? []);
+                    $out .= '<tr>';
+                    foreach ($cells as $ci => $cell) {
+                        if ($hasRowHeader && intval($ci) === 0) {
+                            $out .= '<th scope="row">'.notion_rich_text_html($cell).'</th>';
+                        } else {
+                            $out .= '<td>'.notion_rich_text_html($cell).'</td>';
+                        }
+                    }
+                    $out .= '</tr>';
+                }
+                $out .= '</tbody></table>';
+                break;
+            }
+
             default:
                 // Skip unsupported block types
                 break;
         }
 
         // Additional children (except toggle already rendered)
-        if ($has_children && !in_array($type, ['toggle'])){
+        if ($has_children && !in_array($type, ['toggle','table','callout'])){
             $out .= $render_children($block['id']);
         }
     }
